@@ -6,100 +6,300 @@
 #include <iostream>
 #include <cstdlib>
 #include <ctime>
+#include <fstream>
+#include <sstream>
+#include <thread>
+#include <chrono>
+#include <map>
+#include <deque>
 
 // --- Constants ---
-const int SCREEN_WIDTH = 1200;
-const int SCREEN_HEIGHT = 800;
-const float ATOM_RADIUS = 10.0f;
-const float BOND_DISTANCE = 60.0f;
+int SCREEN_WIDTH = 1200;
+int SCREEN_HEIGHT = 800;
+const float ATOM_RADIUS = 12.0f;
+const float MOLECULE_SCALE = 45.0f;
 const float MAX_SPEED = 2.0f;
 
-// --- Chemistry Data ---
+// Bond lengths in Angstroms (from PubChem/CRC Handbook)
+// Converted to pixels: 1 Angstrom = ~40px for visual clarity
+const float BOND_SINGLE = 54.0f;   // C-C ~1.54A
+const float BOND_DOUBLE = 49.2f;  // C=C ~1.34A (shorter)
+const float BOND_TRIPLE = 44.0f;  // C#C ~1.20A (even shorter)
+const float BOND_AROMATIC = 51.6f; // Benzene ~1.39A
+
+// --- Enums & Structs ---
+enum AppState { STATE_LOADING, STATE_SIMULATION };
+enum ComplexityLevel { LEVEL_SKELETAL = 1, LEVEL_ORGANIC = 2, LEVEL_LEWIS = 3 };
+
 struct Element {
     std::string symbol;
-    int valency; // Max bonds
+    int valency;
+    int valence_electrons; // For Lewis structures
     SDL_Color color;
 };
-
-Element getElement(std::string sym) {
-    if (sym == "C") return {"C", 4, {50, 50, 50, 255}};   // Carbon: Dark Grey
-    if (sym == "O") return {"O", 2, {200, 50, 50, 255}};  // Oxygen: Red
-    if (sym == "N") return {"N", 3, {50, 50, 200, 255}};  // Nitrogen: Blue
-    if (sym == "H") return {"H", 1, {200, 200, 200, 255}};// Hydrogen: White
-    return {"?", 0, {100, 0, 100, 255}};
-}
 
 struct Atom {
     float x, y;
     float vx, vy;
     std::string symbol;
     int max_bonds;
+    int valence_electrons;
     int current_bonds;
     SDL_Color color;
     int id;
-    std::vector<int> bonded_to; // IDs of bonded atoms
+    std::vector<int> bonded_to;
 };
 
+struct MoleculeTemplate {
+    std::string name;
+    struct TAtom { int id; float x, y; std::string symbol; };
+    struct TBond { int id1, id2; int type; };
+    std::vector<TAtom> t_atoms;
+    std::vector<TBond> t_bonds;
+};
+
+// --- Globals ---
 std::vector<Atom> atoms;
+std::vector<MoleculeTemplate> templates;
+std::deque<std::string> system_logs;
 int global_atom_id = 0;
+int current_template_index = 0;
+AppState current_state = STATE_LOADING;
+ComplexityLevel complexity_level = LEVEL_LEWIS;
+bool is_fullscreen = false;
+float loading_progress = 0.0f;
+bool auto_spawn_mode = false;
+float auto_spawn_timer = 0.0f;
+int last_mouse_x = 0, last_mouse_y = 0;
+
+// --- Data ---
+// Covalent radii in pm (picometers) - used for spring target distance calculation
+// Source: PubChem Periodic Table
+struct AtomData {
+    std::string symbol;
+    int valency;
+    int valence_electrons;
+    float covalent_radius; // in pm
+    SDL_Color color;
+};
+
+AtomData getAtomData(std::string sym) {
+    // Symbol, Valency, ValenceE, CovalentRadius(pm), Color (CPK-ish)
+    if (sym == "C") return {"C", 4, 4, 77.0f, {50, 50, 50, 255}};       // Carbon: Grey
+    if (sym == "O") return {"O", 2, 6, 73.0f, {200, 50, 50, 255}};      // Oxygen: Red
+    if (sym == "N") return {"N", 3, 5, 75.0f, {50, 50, 200, 255}};      // Nitrogen: Blue
+    if (sym == "H") return {"H", 1, 1, 32.0f, {200, 200, 200, 255}};    // Hydrogen: White
+    if (sym == "S") return {"S", 2, 6, 102.0f, {200, 200, 50, 255}};    // Sulfur: Yellow
+    if (sym == "P") return {"P", 3, 5, 106.0f, {255, 128, 0, 255}};     // Phosphorus: Orange
+    if (sym == "Cl") return {"Cl", 1, 7, 99.0f, {50, 200, 50, 255}};    // Chlorine: Green
+    if (sym == "Br") return {"Br", 1, 7, 114.0f, {150, 50, 50, 255}};   // Bromine: Dark Red
+    if (sym == "F") return {"F", 1, 7, 64.0f, {144, 224, 80, 255}};     // Fluorine: Light Green
+    return {"?", 0, 0, 70.0f, {100, 0, 100, 255}};
+}
+
+// Legacy wrapper for compatibility
+Element getElement(std::string sym) {
+    AtomData d = getAtomData(sym);
+    return {d.symbol, d.valency, d.valence_electrons, d.color};
+}
+
+// Calculate ideal bond length between two atoms (sum of covalent radii, scaled)
+float getBondLength(std::string sym1, std::string sym2, int bondOrder = 1) {
+    AtomData a1 = getAtomData(sym1);
+    AtomData a2 = getAtomData(sym2);
+    // Sum of covalent radii in pm, scaled to pixels (0.35 px/pm)
+    float baseLen = (a1.covalent_radius + a2.covalent_radius) * 0.35f;
+    // Shorten for multiple bonds
+    if (bondOrder == 2) baseLen *= 0.87f; // ~13% shorter
+    if (bondOrder == 3) baseLen *= 0.78f; // ~22% shorter
+    return baseLen;
+}
 
 // --- Helper Functions ---
-
-void spawnAtom(float x, float y, std::string sym) {
-    Element e = getElement(sym);
-    Atom a;
-    a.x = x;
-    a.y = y;
-    // Random velocity
-    a.vx = ((float)(rand() % 100) / 50.0f - 1.0f) * MAX_SPEED;
-    a.vy = ((float)(rand() % 100) / 50.0f - 1.0f) * MAX_SPEED;
-    a.symbol = e.symbol;
-    a.max_bonds = e.valency;
-    a.current_bonds = 0;
-    a.color = e.color;
-    a.id = global_atom_id++;
-    atoms.push_back(a);
+void log(std::string msg) {
+    system_logs.push_back(msg);
+    if (system_logs.size() > 15) system_logs.pop_front();
 }
 
 float distSq(Atom& a, Atom& b) {
     return (a.x - b.x)*(a.x - b.x) + (a.y - b.y)*(a.y - b.y);
 }
 
-// --- Main Engine ---
+void spawnAtom(float x, float y, std::string sym) {
+    Element e = getElement(sym);
+    Atom a;
+    a.x = x; a.y = y;
+    a.vx = ((float)(rand() % 100) / 50.0f - 1.0f) * MAX_SPEED;
+    a.vy = ((float)(rand() % 100) / 50.0f - 1.0f) * MAX_SPEED;
+    a.symbol = e.symbol;
+    a.max_bonds = e.valency;
+    a.valence_electrons = e.valence_electrons;
+    a.current_bonds = 0;
+    a.color = e.color;
+    a.id = global_atom_id++;
+    atoms.push_back(a);
+}
+
+void loadMolecule(std::string filepath) {
+    std::ifstream file(filepath);
+    if (!file.is_open()) {
+        log("[ERROR] Failed to open " + filepath);
+        return;
+    }
+
+    MoleculeTemplate templ;
+    std::string line;
+    log("[SYSTEM] Accessing " + filepath + "...");
+    
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') {
+            if (line.find("Molecule:") != std::string::npos) {
+                templ.name = line.substr(line.find(":") + 2);
+                log("[FOUND] Compound: " + templ.name);
+            }
+            continue;
+        }
+        std::stringstream ss(line);
+        std::string type;
+        ss >> type;
+        
+        if (type == "ATOM") {
+            int id; float x, y; std::string sym;
+            ss >> id >> x >> y >> sym;
+            templ.t_atoms.push_back({id, x, y, sym});
+        }
+        else if (type == "BOND") {
+            int id1, id2, btype;
+            ss >> id1 >> id2 >> btype;
+            templ.t_bonds.push_back({id1, id2, btype});
+        }
+    }
+    templates.push_back(templ);
+    log("[SUCCESS] Compiled " + templ.name);
+}
+
+void spawnMolecule(int templateIdx, float cx, float cy) {
+    if (templateIdx < 0 || templateIdx >= (int)templates.size()) return;
+    MoleculeTemplate& t = templates[templateIdx];
+    std::map<int, int> id_map;
+    
+    for (auto& ta : t.t_atoms) {
+        float x = cx + ta.x * MOLECULE_SCALE;
+        float y = cy - ta.y * MOLECULE_SCALE;
+        spawnAtom(x, y, ta.symbol);
+        id_map[ta.id] = atoms.back().id;
+        atoms.back().vx = 0; atoms.back().vy = 0;
+    }
+    
+    for (auto& tb : t.t_bonds) {
+        int gid1 = id_map[tb.id1];
+        int gid2 = id_map[tb.id2];
+        Atom* a1 = nullptr; Atom* a2 = nullptr;
+        for (auto& a : atoms) {
+            if (a.id == gid1) a1 = &a;
+            if (a.id == gid2) a2 = &a;
+        }
+        if (a1 && a2) {
+            a1->bonded_to.push_back(a2->id);
+            a1->current_bonds++;
+            a2->bonded_to.push_back(a1->id);
+            a2->current_bonds++;
+        }
+    }
+}
+
+// --- Rendering Helpers ---
+
+void drawText(SDL_Renderer* r, TTF_Font* f, std::string text, int x, int y, SDL_Color c) {
+    if (!f) return;
+    SDL_Surface* surf = TTF_RenderText_Solid(f, text.c_str(), c);
+    if (surf) {
+        SDL_Texture* tex = SDL_CreateTextureFromSurface(r, surf);
+        SDL_Rect rect = {x, y, surf->w, surf->h};
+        SDL_RenderCopy(r, tex, NULL, &rect);
+        SDL_FreeSurface(surf);
+        SDL_DestroyTexture(tex);
+    }
+}
+
+void drawLonePairs(SDL_Renderer* r, Atom& a) {
+    // Calculate lone pairs: (Valence - Bonds) / 2
+    // Note: This is a simplification. Charge is assumed 0.
+    int lone_pairs = (a.valence_electrons - a.current_bonds) / 2;
+    if (lone_pairs <= 0) return;
+
+    // Calculate vector sum of bonds to find "empty" side
+    float sumX = 0, sumY = 0;
+    for (int bid : a.bonded_to) {
+        for (auto& other : atoms) {
+            if (other.id == bid) {
+                float dx = other.x - a.x;
+                float dy = other.y - a.y;
+                float len = sqrt(dx*dx + dy*dy);
+                if (len > 0) { sumX += dx/len; sumY += dy/len; }
+            }
+        }
+    }
+
+    // Normalize repulsion vector
+    float repLen = sqrt(sumX*sumX + sumY*sumY);
+    float dirX = (repLen > 0) ? -(sumX/repLen) : 1.0f; // Opposite to bonds
+    float dirY = (repLen > 0) ? -(sumY/repLen) : 0.0f;
+
+    // Draw pairs
+    SDL_SetRenderDrawColor(r, 255, 255, 0, 200); // Yellow electrons
+    float dist = ATOM_RADIUS + 5.0f;
+    
+    if (lone_pairs == 1) {
+        SDL_RenderDrawPoint(r, a.x + dirX*dist - 2, a.y + dirY*dist);
+        SDL_RenderDrawPoint(r, a.x + dirX*dist + 2, a.y + dirY*dist);
+    } else if (lone_pairs == 2) {
+        // Split angle
+        float angle = atan2(dirY, dirX);
+        float a1 = angle - 0.5f;
+        float a2 = angle + 0.5f;
+        
+        SDL_RenderDrawPoint(r, a.x + cos(a1)*dist, a.y + sin(a1)*dist);
+        SDL_RenderDrawPoint(r, a.x + cos(a1)*dist+2, a.y + sin(a1)*dist);
+        
+        SDL_RenderDrawPoint(r, a.x + cos(a2)*dist, a.y + sin(a2)*dist);
+        SDL_RenderDrawPoint(r, a.x + cos(a2)*dist+2, a.y + sin(a2)*dist);
+    }
+}
+
+// --- Main ---
 
 int main(int argc, char* args[]) {
     srand(time(NULL));
 
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        std::cerr << "SDL could not initialize! SDL_Error: " << SDL_GetError() << std::endl;
-        return 1;
-    }
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) return 1;
+    if (TTF_Init() == -1) return 1;
 
-    if (TTF_Init() == -1) {
-        std::cerr << "TTF could not initialize! TTF_Error: " << TTF_GetError() << std::endl;
-        return 1;
-    }
-
-    SDL_Window* window = SDL_CreateWindow("ChemGen: Molecular Art Station", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
+    // Borderless window for custom controls
+    SDL_Window* window = SDL_CreateWindow("ChemGen", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
+                                        SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN | SDL_WINDOW_BORDERLESS);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
 
-    // Load Font (Try to find a system font, or fallback)
-    // In a real deployment, we'd ship a font. For now, try common Linux paths.
-    TTF_Font* font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16);
-    if (!font) {
-        // Fallback
-        font = TTF_OpenFont("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 16);
-    }
-    if (!font) {
-        std::cerr << "Warning: Could not load font. Text will not display." << std::endl;
-    }
+    TTF_Font* font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14);
+    if (!font) font = TTF_OpenFont("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 14);
+    TTF_Font* fontLarge = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24);
+    if (!fontLarge) fontLarge = TTF_OpenFont("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 24);
 
     bool quit = false;
     SDL_Event e;
-
+    
+    // Loading Sequence Data
+    log("[INIT] Molecular Art Station v1.0");
+    log("[MEM] Allocating particle buffers...");
+    
     // Simulation Loop
     while (!quit) {
-        // 1. Input
+        // Update window size for relative UI
+        int winW, winH;
+        SDL_GetWindowSize(window, &winW, &winH);
+        SCREEN_WIDTH = winW;
+        SCREEN_HEIGHT = winH;
+
         int mouseX, mouseY;
         Uint32 mouseState = SDL_GetMouseState(&mouseX, &mouseY);
 
@@ -108,176 +308,512 @@ int main(int argc, char* args[]) {
             if (e.type == SDL_KEYDOWN) {
                 if (e.key.keysym.sym == SDLK_ESCAPE) quit = true;
                 if (e.key.keysym.sym == SDLK_SPACE) atoms.clear();
+                if (e.key.keysym.sym == SDLK_r) {
+                    atoms.clear();
+                    log("[SYS] Reset Simulation");
+                }
+                if (e.key.keysym.sym == SDLK_f) {
+                    is_fullscreen = !is_fullscreen;
+                    SDL_SetWindowFullscreen(window, is_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                }
+                // Number keys for complexity
+                if (e.key.keysym.sym == SDLK_1 || e.key.keysym.sym == SDLK_KP_1) complexity_level = LEVEL_SKELETAL;
+                if (e.key.keysym.sym == SDLK_2 || e.key.keysym.sym == SDLK_KP_2) complexity_level = LEVEL_ORGANIC;
+                if (e.key.keysym.sym == SDLK_3 || e.key.keysym.sym == SDLK_KP_3) complexity_level = LEVEL_LEWIS;
+                
+                // Enter for Auto-Spawn
+                if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_RETURN2 || e.key.keysym.sym == SDLK_KP_ENTER) {
+                    spawnMolecule(current_template_index, (float)mouseX, (float)mouseY);
+                    auto_spawn_mode = true;
+                    auto_spawn_timer = 0;
+                }
+            }
+            // UI Clicks
+            if (e.type == SDL_MOUSEBUTTONDOWN) {
+                // Window Controls (Top Right)
+                if (mouseX > SCREEN_WIDTH - 30 && mouseY < 30) quit = true; // Close
+                if (mouseX > SCREEN_WIDTH - 60 && mouseX < SCREEN_WIDTH - 30 && mouseY < 30) { // Maximize/Restore
+                    is_fullscreen = !is_fullscreen;
+                    SDL_SetWindowFullscreen(window, is_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                }
+                if (mouseX > SCREEN_WIDTH - 90 && mouseX < SCREEN_WIDTH - 60 && mouseY < 30) { // Minimize
+                    SDL_MinimizeWindow(window);
+                }
+                
+                // Complexity Slider (Bottom Left)
+                if (mouseY > SCREEN_HEIGHT - 40 && mouseY < SCREEN_HEIGHT - 10) {
+                    if (mouseX > 10 && mouseX < 110) complexity_level = LEVEL_SKELETAL;
+                    if (mouseX > 120 && mouseX < 220) complexity_level = LEVEL_ORGANIC;
+                    if (mouseX > 230 && mouseX < 330) complexity_level = LEVEL_LEWIS;
+                    if (mouseX > 330 && mouseX < 410) { // Reset
+                        atoms.clear();
+                        log("[SYS] Reset Simulation");
+                    }
+                    // Mute spawn on click
+                    continue; 
+                }
             }
         }
 
-        // Mouse Interaction: Spawn atoms
-        if (mouseState & SDL_BUTTON(SDL_BUTTON_LEFT)) {
-            // Spawn a random organic atom
-            int r = rand() % 100;
-            std::string sym = "C";
-            if (r > 60) sym = "H";
-            if (r > 85) sym = "O";
-            if (r > 95) sym = "N";
-            spawnAtom((float)mouseX + (rand()%20-10), (float)mouseY + (rand()%20-10), sym);
-        }
+        // --- LOGIC ---
+        
+        if (current_state == STATE_LOADING) {
+            loading_progress += 0.5f;
+            if (loading_progress == 20.0f) loadMolecule("data/benzene.chem");
+            if (loading_progress == 60.0f) loadMolecule("data/caffeine.chem");
+            if (loading_progress > 120.0f) {
+                current_state = STATE_SIMULATION;
+                log("[SYS] Simulation Started.");
+            }
+        } else {
+            // Auto Spawn Logic
+            if (mouseX != last_mouse_x || mouseY != last_mouse_y) {
+                auto_spawn_mode = false; // Snap back to manual on move
+            }
+            last_mouse_x = mouseX;
+            last_mouse_y = mouseY;
 
-        // 2. Physics & Chemistry
-        for (size_t i = 0; i < atoms.size(); i++) {
-            // Move
-            atoms[i].x += atoms[i].vx;
-            atoms[i].y += atoms[i].vy;
+            if (auto_spawn_mode) {
+                auto_spawn_timer += 1.0f;
+                if (auto_spawn_timer > 60.0f) { // Every ~1 sec
+                    float rx = (float)(rand() % SCREEN_WIDTH);
+                    float ry = (float)(rand() % SCREEN_HEIGHT);
+                    spawnMolecule(current_template_index, rx, ry);
+                    auto_spawn_timer = 0;
+                }
+            }
 
-            // Bounce off walls
-            if (atoms[i].x < 0 || atoms[i].x > SCREEN_WIDTH) atoms[i].vx *= -1;
-            if (atoms[i].y < 0 || atoms[i].y > SCREEN_HEIGHT) atoms[i].vy *= -1;
+            // Simulation Logic
+            if (mouseState & SDL_BUTTON(SDL_BUTTON_LEFT) && mouseY > 40 && mouseY < SCREEN_HEIGHT - 50) { // Don't spawn on UI areas
+                int r = rand() % 100;
+                std::string sym = "C";
+                // Adjusted probabilities: Less H, more heteroatoms
+                if (r > 50) sym = "O"; 
+                if (r > 75) sym = "N";
+                // Add S and P with lower probability
+                if (r > 90) sym = "S"; 
+                if (r > 95) sym = "P";
+                // Very rare H spawn (mostly H should come from filling valency, not random spawn)
+                if (r > 98) sym = "H"; 
 
-            // Bonding Logic
-            // Very naive O(N^2) for now, fine for < 1000 atoms
-            if (atoms[i].current_bonds < atoms[i].max_bonds) {
+                spawnAtom((float)mouseX + (rand()%20-10), (float)mouseY + (rand()%20-10), sym);
+            }
+            if (mouseState & SDL_BUTTON(SDL_BUTTON_RIGHT)) {
+                if (rand() % 10 == 0) {
+                    spawnMolecule(current_template_index, (float)mouseX, (float)mouseY);
+                    current_template_index = (current_template_index + 1) % templates.size();
+                }
+            }
+
+            // --- PHYSICS ENGINE REWRITE ---
+            
+            // 1. Integration & Wall Constraints
+            for (auto& a : atoms) {
+                a.x += a.vx; 
+                a.y += a.vy;
+                
+                // Hard Wall Bounce
+                if (a.x < ATOM_RADIUS) { a.x = ATOM_RADIUS; a.vx = abs(a.vx) * 0.5f; }
+                if (a.x > SCREEN_WIDTH - ATOM_RADIUS) { a.x = SCREEN_WIDTH - ATOM_RADIUS; a.vx = -abs(a.vx) * 0.5f; }
+                if (a.y < ATOM_RADIUS) { a.y = ATOM_RADIUS; a.vy = abs(a.vy) * 0.5f; }
+                if (a.y > SCREEN_HEIGHT - ATOM_RADIUS) { a.y = SCREEN_HEIGHT - ATOM_RADIUS; a.vy = -abs(a.vy) * 0.5f; }
+                
+                // Friction
+                a.vx *= 0.98f; 
+                a.vy *= 0.98f;
+            }
+
+            // 2. Dynamic Bonding
+            for (size_t i = 0; i < atoms.size(); i++) {
+                if (atoms[i].current_bonds >= atoms[i].max_bonds) continue;
+                
                 for (size_t j = i + 1; j < atoms.size(); j++) {
-                    if (atoms[j].current_bonds < atoms[j].max_bonds) {
-                        // Check if already bonded
-                        bool already_bonded = false;
-                        for (int id : atoms[i].bonded_to) {
-                            if (id == atoms[j].id) already_bonded = true;
-                        }
+                    if (atoms[j].current_bonds >= atoms[j].max_bonds) continue;
+
+                    // Check if already bonded
+                    bool already_bonded = false;
+                    for (int id : atoms[i].bonded_to) if (id == atoms[j].id) already_bonded = true;
+                    if (already_bonded) continue;
+
+                    float d2 = distSq(atoms[i], atoms[j]);
+                    // Snap distance: slightly larger than single bond to catch pairs
+                    float snapDist = BOND_SINGLE * 1.3f; 
+                    
+                    if (d2 < snapDist*snapDist) {
+                        // Logic: Only bond if compatible
+                        // Prevent random H-H or H-C unless specific conditions (optional, per user request)
+                        // User asked to "prevent random H spawning" - handled in spawn logic
+                        // Here we just ensure valid bonds.
                         
-                        if (!already_bonded) {
-                            float d2 = distSq(atoms[i], atoms[j]);
-                            if (d2 < BOND_DISTANCE * BOND_DISTANCE) {
-                                // Form Bond
-                                atoms[i].bonded_to.push_back(atoms[j].id);
-                                atoms[i].current_bonds++;
-                                atoms[j].bonded_to.push_back(atoms[i].id);
-                                atoms[j].current_bonds++;
-                                
-                                // Snap velocities together (inelastic collision)
-                                float avg_vx = (atoms[i].vx + atoms[j].vx) / 2.0f;
-                                float avg_vy = (atoms[i].vy + atoms[j].vy) / 2.0f;
-                                atoms[i].vx = avg_vx;
-                                atoms[i].vy = avg_vy;
-                                atoms[j].vx = avg_vx;
-                                atoms[j].vy = avg_vy;
+                        atoms[i].bonded_to.push_back(atoms[j].id);
+                        atoms[i].current_bonds++;
+                        atoms[j].bonded_to.push_back(atoms[i].id);
+                        atoms[j].current_bonds++;
+                    }
+                }
+            }
+
+            // 3. Hard Lock Constraints (Iterative Solver)
+            // This replaces springs with rigid distance constraints
+            int iterations = 10; // More iterations = stiffer bonds
+            for (int k = 0; k < iterations; k++) {
+                for (size_t i = 0; i < atoms.size(); i++) {
+                    for (int tid : atoms[i].bonded_to) {
+                        // Find neighbor
+                        int nIdx = -1;
+                        for(size_t m=0; m<atoms.size(); m++) if(atoms[m].id == tid) { nIdx = m; break; }
+                        if (nIdx == -1) continue;
+
+                        // Avoid double processing
+                        if (atoms[i].id > atoms[nIdx].id) continue;
+
+                        Atom& a1 = atoms[i];
+                        Atom& a2 = atoms[nIdx];
+
+                        float dx = a2.x - a1.x;
+                        float dy = a2.y - a1.y;
+                        float dist = sqrt(dx*dx + dy*dy);
+                        if (dist < 0.001f) dist = 0.001f;
+
+                        // Determine Bond Target Length
+                        int order = 1;
+                        if ((a1.symbol == "C" || a1.symbol == "O" || a1.symbol == "N") &&
+                            (a2.symbol == "C" || a2.symbol == "O" || a2.symbol == "N")) {
+                             // Simple heuristic for double bonds if both unsaturated
+                             if (a1.current_bonds < a1.max_bonds && a2.current_bonds < a2.max_bonds) order = 2;
+                        }
+                        float target = getBondLength(a1.symbol, a2.symbol, order);
+
+                        // Constraint Correction
+                        float diff = dist - target;
+                        float correction = diff / dist * 0.5f; // Split move equally
+                        
+                        float offX = dx * correction;
+                        float offY = dy * correction;
+
+                        a1.x += offX; a1.y += offY;
+                        a2.x -= offX; a2.y -= offY;
+                        
+                        // Update velocities to reflect the constraint (optional but helps stability)
+                        // For now, position correction is enough for "Hard Lock"
+                    }
+                }
+            }
+
+            // 4. Molecule Collision (Bouncing entire molecules)
+            // Step A: Identify Molecules (Connected Components)
+            std::vector<std::vector<int>> molecules;
+            std::vector<bool> visited(atoms.size(), false);
+            std::map<int, int> idToIndex;
+            for(size_t i=0; i<atoms.size(); i++) idToIndex[atoms[i].id] = i;
+
+            for(size_t i=0; i<atoms.size(); i++) {
+                if(visited[i]) continue;
+                std::vector<int> mol;
+                std::deque<int> q;
+                q.push_back(i);
+                visited[i] = true;
+                while(!q.empty()) {
+                    int curr = q.front(); q.pop_front();
+                    mol.push_back(curr);
+                    for(int bid : atoms[curr].bonded_to) {
+                        if(idToIndex.count(bid)) {
+                            int neighborIdx = idToIndex[bid];
+                            if(!visited[neighborIdx]) {
+                                visited[neighborIdx] = true;
+                                q.push_back(neighborIdx);
                             }
                         }
                     }
+                }
+                molecules.push_back(mol);
+            }
+
+            // Step B: Collide Molecules
+            for (size_t i = 0; i < molecules.size(); i++) {
+                for (size_t j = i + 1; j < molecules.size(); j++) {
+                    // Calculate Bounding Circles
+                    float cx1=0, cy1=0, cx2=0, cy2=0;
+                    for(int idx : molecules[i]) { cx1 += atoms[idx].x; cy1 += atoms[idx].y; }
+                    for(int idx : molecules[j]) { cx2 += atoms[idx].x; cy2 += atoms[idx].y; }
+                    cx1 /= molecules[i].size(); cy1 /= molecules[i].size();
+                    cx2 /= molecules[j].size(); cy2 /= molecules[j].size();
+
+                    float r1=0, r2=0;
+                    for(int idx : molecules[i]) {
+                        float d = sqrt(pow(atoms[idx].x - cx1, 2) + pow(atoms[idx].y - cy1, 2));
+                        if(d > r1) r1 = d;
+                    }
+                    for(int idx : molecules[j]) {
+                        float d = sqrt(pow(atoms[idx].x - cx2, 2) + pow(atoms[idx].y - cy2, 2));
+                        if(d > r2) r2 = d;
+                    }
+                    r1 += ATOM_RADIUS; r2 += ATOM_RADIUS; // Add atom radius buffer
+
+                    // Check Collision
+                    float dx = cx2 - cx1;
+                    float dy = cy2 - cy1;
+                    float dist = sqrt(dx*dx + dy*dy);
+                    float minDist = r1 + r2;
+
+                    if (dist < minDist && dist > 0) {
+                        // Resolve Collision: Move entire molecules apart
+                        float overlap = minDist - dist;
+                        float nx = dx / dist;
+                        float ny = dy / dist;
+                        
+                        // Move proportional to inverse mass (here mass = atom count)
+                        float m1 = (float)molecules[i].size();
+                        float m2 = (float)molecules[j].size();
+                        float totalM = m1 + m2;
+                        
+                        float move1 = overlap * (m2 / totalM);
+                        float move2 = overlap * (m1 / totalM);
+
+                        for(int idx : molecules[i]) {
+                            atoms[idx].x -= nx * move1;
+                            atoms[idx].y -= ny * move1;
+                            // Add bounce impulse
+                            atoms[idx].vx -= nx * 0.5f; atoms[idx].vy -= ny * 0.5f;
+                        }
+                        for(int idx : molecules[j]) {
+                            atoms[idx].x += nx * move2;
+                            atoms[idx].y += ny * move2;
+                            // Add bounce impulse
+                            atoms[idx].vx += nx * 0.5f; atoms[idx].vy += ny * 0.5f;
+                        }
+                    }
+                }
+            }
+            // 5. Auto-Saturation (Lewis Mode)
+            // If in Lewis mode, ensure all atoms have full valency by spawning Hydrogens
+            if (complexity_level == LEVEL_LEWIS) {
+                static int saturation_timer = 0;
+                saturation_timer++;
+                if (saturation_timer > 30) { // Check every ~0.5s
+                    saturation_timer = 0;
+                    // Iterate backwards to allow spawning without invalidating iterators immediately
+                    // (Though vector reallocation might still happen, so we use indices)
+                    size_t current_size = atoms.size(); 
+                    for (size_t i = 0; i < current_size; i++) {
+                        // Only saturate if the atom is somewhat stable (not flying too fast)
+                        if (abs(atoms[i].vx) > 0.5f || abs(atoms[i].vy) > 0.5f) continue;
+
+                        int missing = atoms[i].max_bonds - atoms[i].current_bonds;
+                        if (missing > 0) {
+                            // Calculate base angle based on existing bonds to avoid overlap
+                            float base_angle = 0.0f;
+                            if (!atoms[i].bonded_to.empty()) {
+                                // Find angle away from first bond to distribute H on the other side
+                                for(auto& other : atoms) {
+                                    if(other.id == atoms[i].bonded_to[0]) {
+                                        base_angle = atan2(atoms[i].y - other.y, atoms[i].x - other.x);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                base_angle = (float)(rand() % 360) * 3.14159f / 180.0f;
+                            }
+
+                            // Spawn all needed Hydrogens at once
+                            for (int k = 0; k < missing; k++) {
+                                // Spread hydrogens out in a fan or circle
+                                float angle_offset = (missing == 1) ? 0.0f : ((k + 1) * (3.14159f / (missing + 1)) - 1.57f);
+                                if (atoms[i].bonded_to.empty()) angle_offset = k * (6.28f / missing); // Full circle if no bonds
+                                
+                                float angle = base_angle + angle_offset;
+                                // Add slight randomness for organic feel
+                                angle += ((rand()%100)/100.0f - 0.5f) * 0.2f;
+
+                                float dist = BOND_SINGLE;
+                                float hx = atoms[i].x + cos(angle) * dist;
+                                float hy = atoms[i].y + sin(angle) * dist;
+                                
+                                spawnAtom(hx, hy, "H");
+                                // Force bond immediately
+                                Atom& h = atoms.back();
+                                h.vx = atoms[i].vx; h.vy = atoms[i].vy; // Match velocity
+                                
+                                atoms[i].bonded_to.push_back(h.id);
+                                atoms[i].current_bonds++;
+                                h.bonded_to.push_back(atoms[i].id);
+                                h.current_bonds++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- RENDER ---
+        SDL_SetRenderDrawColor(renderer, 20, 20, 25, 255);
+        SDL_RenderClear(renderer);
+
+        if (current_state == STATE_LOADING) {
+            // Draw Logs
+            int y = 100;
+            for (auto& log : system_logs) {
+                drawText(renderer, font, log, 50, y, {0, 255, 0, 255});
+                y += 20;
+            }
+            // Draw Loading Bar
+            SDL_Rect bar = {50, y + 20, (int)(loading_progress * 5), 10};
+            SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255);
+            SDL_RenderFillRect(renderer, &bar);
+            
+            // Draw Preview Molecule (Rotating)
+            if (!templates.empty()) {
+                MoleculeTemplate& t = templates.back();
+                float cx = SCREEN_WIDTH / 2 + 200;
+                float cy = SCREEN_HEIGHT / 2;
+                float angle = loading_progress * 0.1f;
+                
+                for (auto& ta : t.t_atoms) {
+                    // Rotate
+                    float rx = ta.x * cos(angle) - ta.y * sin(angle);
+                    float ry = ta.x * sin(angle) + ta.y * cos(angle);
+                    
+                    SDL_Rect r = {(int)(cx + rx*40), (int)(cy + ry*40), 10, 10};
+                    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+                    SDL_RenderFillRect(renderer, &r);
+                }
+            }
+        } 
+        else {
+            // Draw Bonds
+            SDL_SetRenderDrawColor(renderer, 100, 100, 100, 255);
+            for (auto& a : atoms) {
+                for (int tid : a.bonded_to) {
+                    // Avoid drawing twice
+                    if (a.id > tid) continue;
+
+                    for (auto& t : atoms) {
+                        if (t.id == tid) {
+                            // Determine bond order (simplified: O=O, C=O, C#N etc based on valency remaining)
+                            // For this art demo, we'll just assume double bonds for O, N if unsaturated
+                            int bondOrder = 1;
+                            if ((a.symbol == "O" || a.symbol == "N" || a.symbol == "C") && 
+                                (t.symbol == "O" || t.symbol == "N" || t.symbol == "C")) {
+                                // Heuristic: if both have spare valency, draw double
+                                if (a.current_bonds < a.max_bonds && t.current_bonds < t.max_bonds) bondOrder = 2;
+                            }
+
+                            // Draw Lines
+                            if (bondOrder == 2) {
+                                SDL_RenderDrawLine(renderer, a.x-3, a.y-3, t.x-3, t.y-3);
+                                SDL_RenderDrawLine(renderer, a.x+3, a.y+3, t.x+3, t.y+3);
+                            } else if (bondOrder == 3) {
+                                SDL_RenderDrawLine(renderer, a.x, a.y, t.x, t.y);
+                                SDL_RenderDrawLine(renderer, a.x-4, a.y-4, t.x-4, t.y-4);
+                                SDL_RenderDrawLine(renderer, a.x+4, a.y+4, t.x+4, t.y+4);
+                            } else {
+                                SDL_RenderDrawLine(renderer, a.x, a.y, t.x, t.y);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Draw Atoms
+            for (auto& a : atoms) {
+                bool draw = true;
+                bool drawTextSym = true;
+
+                if (complexity_level == LEVEL_SKELETAL) {
+                    draw = false; // Hide atoms in skeletal
+                }
+                else if (complexity_level == LEVEL_ORGANIC) {
+                    // Hide Hydrogens on Carbons
+                    if (a.symbol == "H") {
+                        for (int bid : a.bonded_to) {
+                            for (auto& n : atoms) if (n.id == bid && n.symbol == "C") draw = false;
+                        }
+                    }
+                    // Carbons are just dots
+                    if (a.symbol == "C") drawTextSym = false;
+                }
+
+                if (draw) {
+                    SDL_Rect rect = {(int)(a.x - ATOM_RADIUS), (int)(a.y - ATOM_RADIUS), (int)(ATOM_RADIUS*2), (int)(ATOM_RADIUS*2)};
+                    SDL_SetRenderDrawColor(renderer, a.color.r, a.color.g, a.color.b, a.color.a);
+                    if (complexity_level == LEVEL_ORGANIC && a.symbol == "C") {
+                        // Small dot for Carbon
+                        SDL_Rect small = {(int)a.x-3, (int)a.y-3, 6, 6};
+                        SDL_RenderFillRect(renderer, &small);
+                    } else {
+                        SDL_RenderFillRect(renderer, &rect);
+                        if (drawTextSym) {
+                            SDL_Color tc = {255, 255, 255};
+                            if (a.symbol == "H") tc = {0,0,0};
+                            drawText(renderer, font, a.symbol, a.x-5, a.y-8, tc);
+                        }
+                    }
+                }
+                
+                if (complexity_level == LEVEL_LEWIS) {
+                    drawLonePairs(renderer, a);
                 }
             }
             
-            // Spring forces for bonded atoms (keep them at optimal distance)
-            for (int targetId : atoms[i].bonded_to) {
-                for (size_t j = 0; j < atoms.size(); j++) {
-                    if (atoms[j].id == targetId) {
-                        float dx = atoms[j].x - atoms[i].x;
-                        float dy = atoms[j].y - atoms[i].y;
-                        float dist = sqrt(dx*dx + dy*dy);
-                        
-                        if (dist > 0) {
-                            // Hooke's Law: F = k * (current_dist - optimal_dist)
-                            float k = 0.05f; // Spring constant
-                            float force = (dist - BOND_DISTANCE) * k;
-                            
-                            float fx = (dx / dist) * force;
-                            float fy = (dy / dist) * force;
-                            
-                            atoms[i].vx += fx;
-                            atoms[i].vy += fy;
-                        }
-                        break;
-                    }
+            // Draw UI Overlay
+            // Get current window size for relative positioning
+            int winW, winH;
+            SDL_GetWindowSize(window, &winW, &winH);
+            SCREEN_WIDTH = winW;
+            SCREEN_HEIGHT = winH;
+
+            // Window Controls (Top Right) - Line icons only, appear on hover
+            if (mouseY < 35) {
+                SDL_SetRenderDrawColor(renderer, 30, 30, 35, 180);
+                SDL_Rect header = {winW - 70, 0, 70, 30};
+                SDL_RenderFillRect(renderer, &header);
+                
+                // Maximize/Restore icon (two overlapping squares or single square)
+                SDL_SetRenderDrawColor(renderer, 180, 180, 180, 255);
+                if (is_fullscreen) {
+                    // Restore icon: two overlapping rectangles
+                    SDL_RenderDrawLine(renderer, winW-55, 8, winW-45, 8);
+                    SDL_RenderDrawLine(renderer, winW-55, 8, winW-55, 18);
+                    SDL_RenderDrawLine(renderer, winW-58, 12, winW-48, 12);
+                    SDL_RenderDrawLine(renderer, winW-58, 12, winW-58, 22);
+                    SDL_RenderDrawLine(renderer, winW-58, 22, winW-48, 22);
+                    SDL_RenderDrawLine(renderer, winW-48, 12, winW-48, 22);
+                } else {
+                    // Maximize icon: single rectangle
+                    SDL_Rect maxIcon = {winW-58, 8, 14, 14};
+                    SDL_RenderDrawRect(renderer, &maxIcon);
                 }
+                
+                // Close icon (X)
+                SDL_SetRenderDrawColor(renderer, 255, 80, 80, 255);
+                SDL_RenderDrawLine(renderer, winW-25, 8, winW-15, 22);
+                SDL_RenderDrawLine(renderer, winW-25, 22, winW-15, 8);
             }
+            
+            // Complexity Slider (Bottom Left) - Relative to window
+            int by = winH - 35;
+            SDL_SetRenderDrawColor(renderer, 25, 25, 30, 200);
+            SDL_Rect footer = {0, winH-45, 420, 45}; // Expanded width
+            SDL_RenderFillRect(renderer, &footer);
+            
+            SDL_Color c1 = (complexity_level == LEVEL_SKELETAL) ? SDL_Color{0, 255, 100, 255} : SDL_Color{100, 100, 100, 255};
+            SDL_Color c2 = (complexity_level == LEVEL_ORGANIC) ? SDL_Color{0, 255, 100, 255} : SDL_Color{100, 100, 100, 255};
+            SDL_Color c3 = (complexity_level == LEVEL_LEWIS) ? SDL_Color{0, 255, 100, 255} : SDL_Color{100, 100, 100, 255};
+            SDL_Color cR = {255, 100, 100, 255};
 
-            // Repulsive forces between bonded neighbors (VSEPR approximation)
-            // Atoms bonded to the SAME central atom should repel each other
-            if (atoms[i].bonded_to.size() > 1) {
-                for (size_t b1 = 0; b1 < atoms[i].bonded_to.size(); b1++) {
-                    for (size_t b2 = b1 + 1; b2 < atoms[i].bonded_to.size(); b2++) {
-                        // Find the two neighbor atoms
-                        Atom* n1 = nullptr;
-                        Atom* n2 = nullptr;
-                        
-                        for (size_t k = 0; k < atoms.size(); k++) {
-                            if (atoms[k].id == atoms[i].bonded_to[b1]) n1 = &atoms[k];
-                            if (atoms[k].id == atoms[i].bonded_to[b2]) n2 = &atoms[k];
-                        }
-                        
-                        if (n1 && n2) {
-                            float dx = n1->x - n2->x;
-                            float dy = n1->y - n2->y;
-                            float distSq = dx*dx + dy*dy;
-                            
-                            if (distSq > 0 && distSq < (BOND_DISTANCE * 2.5f) * (BOND_DISTANCE * 2.5f)) {
-                                float dist = sqrt(distSq);
-                                float repulsion = 2.0f / dist; // Inverse distance force
-                                
-                                float fx = (dx / dist) * repulsion;
-                                float fy = (dy / dist) * repulsion;
-                                
-                                n1->vx += fx;
-                                n1->vy += fy;
-                                n2->vx -= fx;
-                                n2->vy -= fy;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Friction / Damping (prevent explosion)
-            atoms[i].vx *= 0.98f;
-            atoms[i].vy *= 0.98f;
-        }
-
-        // 3. Render
-        SDL_SetRenderDrawColor(renderer, 20, 20, 25, 255); // Dark background
-        SDL_RenderClear(renderer);
-
-        // Draw Bonds
-        SDL_SetRenderDrawColor(renderer, 100, 100, 100, 255);
-        for (size_t i = 0; i < atoms.size(); i++) {
-            for (int targetId : atoms[i].bonded_to) {
-                // Find target atom (inefficient search, but simple)
-                for (size_t j = 0; j < atoms.size(); j++) {
-                    if (atoms[j].id == targetId) {
-                        // Draw line
-                        SDL_RenderDrawLine(renderer, (int)atoms[i].x, (int)atoms[i].y, (int)atoms[j].x, (int)atoms[j].y);
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Draw Atoms
-        for (auto& a : atoms) {
-            // Draw Circle (filled rect for simplicity in low-level SDL without extensions)
-            SDL_Rect rect = {(int)(a.x - ATOM_RADIUS), (int)(a.y - ATOM_RADIUS), (int)(ATOM_RADIUS*2), (int)(ATOM_RADIUS*2)};
-            SDL_SetRenderDrawColor(renderer, a.color.r, a.color.g, a.color.b, a.color.a);
-            SDL_RenderFillRect(renderer, &rect);
-
-            // Draw Symbol
-            if (font) {
-                SDL_Color textColor = {255, 255, 255};
-                if (a.symbol == "H") textColor = {0, 0, 0}; // Black text for Hydrogen
-
-                SDL_Surface* textSurface = TTF_RenderText_Solid(font, a.symbol.c_str(), textColor);
-                if (textSurface) {
-                    SDL_Texture* textTexture = SDL_CreateTextureFromSurface(renderer, textSurface);
-                    SDL_Rect textRect = {(int)(a.x - textSurface->w/2), (int)(a.y - textSurface->h/2), textSurface->w, textSurface->h};
-                    SDL_RenderCopy(renderer, textTexture, NULL, &textRect);
-                    SDL_FreeSurface(textSurface);
-                    SDL_DestroyTexture(textTexture);
-                }
-            }
+            drawText(renderer, font, "[1] Skeletal", 15, by, c1);
+            drawText(renderer, font, "[2] Organic", 120, by, c2);
+            drawText(renderer, font, "[3] Lewis", 225, by, c3);
+            drawText(renderer, font, "[R] Reset", 330, by, cR);
         }
 
         SDL_RenderPresent(renderer);
-        SDL_Delay(16); // ~60 FPS
+        SDL_Delay(16);
     }
 
-    // Cleanup
     if (font) TTF_CloseFont(font);
+    if (fontLarge) TTF_CloseFont(fontLarge);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     TTF_Quit();
