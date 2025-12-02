@@ -7,8 +7,7 @@ ChemGen is a C++ based particle engine where particles behave like atoms. They r
 
 It bridges "Real Science" and "Generative Art" by fetching real molecular structures from the NCBI PubChem database using Bash scripts, converting them into templates, and then using those templates to spawn "chemical debris" that reassembles procedurally.
 
-First demo:
-https://youtu.be/3W1T1ZDGFEk
+Video demo: https://youtu.be/-96aCa3wix4
 
 ## Tech Stack
 - **Language:** C++ (No Python, no heavy frameworks)
@@ -47,7 +46,7 @@ Downloads real molecular structures (e.g., Caffeine, Benzene) from NCBI to use a
 ```
 
 ## Controls
-- **Mouse Move:** Emits atoms/radicals.
-- **Click:** Spawns a complex molecule from the fetched templates.
-- **Space:** Clear screen.
+- **Mouse Click:** Emits atoms/radicals.
+- **Enter:** Spawns a complex molecule from the fetched templates.
+- **R or Space:** Clear screen.
 - **ESC:** Quit.
