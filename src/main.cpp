@@ -12,6 +12,7 @@
 #include <chrono>
 #include <map>
 #include <deque>
+#include <dirent.h>
 
 // --- Constants ---
 int SCREEN_WIDTH = 1200;
@@ -26,6 +27,7 @@ const float BOND_SINGLE = 54.0f;   // C-C ~1.54A
 const float BOND_DOUBLE = 49.2f;  // C=C ~1.34A (shorter)
 const float BOND_TRIPLE = 44.0f;  // C#C ~1.20A (even shorter)
 const float BOND_AROMATIC = 51.6f; // Benzene ~1.39A
+const float BOND_HYDROGEN_LEN = 70.0f; // ~1.8-2.0A
 
 // --- Enums & Structs ---
 enum AppState { STATE_LOADING, STATE_SIMULATION };
@@ -38,16 +40,22 @@ struct Element {
     SDL_Color color;
 };
 
+struct Bond {
+    int target_id;
+    int order;
+};
+
 struct Atom {
     float x, y;
     float vx, vy;
     std::string symbol;
+    std::string parent_molecule; // For specificity (e.g. "Adenine")
     int max_bonds;
     int valence_electrons;
-    int current_bonds;
+    int current_valency; // Actual valency used (Single=1, Double=2)
     SDL_Color color;
     int id;
-    std::vector<int> bonded_to;
+    std::vector<Bond> bonds;
 };
 
 struct MoleculeTemplate {
@@ -68,8 +76,6 @@ AppState current_state = STATE_LOADING;
 ComplexityLevel complexity_level = LEVEL_LEWIS;
 bool is_fullscreen = false;
 float loading_progress = 0.0f;
-bool auto_spawn_mode = false;
-float auto_spawn_timer = 0.0f;
 int last_mouse_x = 0, last_mouse_y = 0;
 
 // --- Data ---
@@ -112,29 +118,31 @@ float getBondLength(std::string sym1, std::string sym2, int bondOrder = 1) {
     // Shorten for multiple bonds
     if (bondOrder == 2) baseLen *= 0.87f; // ~13% shorter
     if (bondOrder == 3) baseLen *= 0.78f; // ~22% shorter
+    if (bondOrder == 4) return BOND_HYDROGEN_LEN; // Hydrogen Bond
     return baseLen;
 }
 
 // --- Helper Functions ---
 void log(std::string msg) {
     system_logs.push_back(msg);
-    if (system_logs.size() > 15) system_logs.pop_front();
+    if (system_logs.size() > 100) system_logs.pop_front(); // Increased log buffer to 100
 }
 
 float distSq(Atom& a, Atom& b) {
     return (a.x - b.x)*(a.x - b.x) + (a.y - b.y)*(a.y - b.y);
 }
 
-void spawnAtom(float x, float y, std::string sym) {
+void spawnAtom(float x, float y, std::string sym, std::string parent = "") {
     Element e = getElement(sym);
     Atom a;
     a.x = x; a.y = y;
     a.vx = ((float)(rand() % 100) / 50.0f - 1.0f) * MAX_SPEED;
     a.vy = ((float)(rand() % 100) / 50.0f - 1.0f) * MAX_SPEED;
     a.symbol = e.symbol;
+    a.parent_molecule = parent;
     a.max_bonds = e.valency;
     a.valence_electrons = e.valence_electrons;
-    a.current_bonds = 0;
+    a.current_valency = 0;
     a.color = e.color;
     a.id = global_atom_id++;
     atoms.push_back(a);
@@ -178,6 +186,28 @@ void loadMolecule(std::string filepath) {
     log("[SUCCESS] Compiled " + templ.name);
 }
 
+void loadAllMolecules(std::string dirPath) {
+    DIR *dir;
+    struct dirent *ent;
+    if ((dir = opendir(dirPath.c_str())) != NULL) {
+        std::vector<std::string> files;
+        while ((ent = readdir(dir)) != NULL) {
+            std::string fname = ent->d_name;
+            if (fname.length() > 5 && fname.substr(fname.length()-5) == ".chem") {
+                files.push_back(dirPath + "/" + fname);
+            }
+        }
+        closedir(dir);
+        
+        // Sort to ensure deterministic order
+        for(const auto& f : files) {
+            loadMolecule(f);
+        }
+    } else {
+        log("[ERROR] Could not open " + dirPath);
+    }
+}
+
 void spawnMolecule(int templateIdx, float cx, float cy) {
     if (templateIdx < 0 || templateIdx >= (int)templates.size()) return;
     MoleculeTemplate& t = templates[templateIdx];
@@ -186,7 +216,7 @@ void spawnMolecule(int templateIdx, float cx, float cy) {
     for (auto& ta : t.t_atoms) {
         float x = cx + ta.x * MOLECULE_SCALE;
         float y = cy - ta.y * MOLECULE_SCALE;
-        spawnAtom(x, y, ta.symbol);
+        spawnAtom(x, y, ta.symbol, t.name);
         id_map[ta.id] = atoms.back().id;
         atoms.back().vx = 0; atoms.back().vy = 0;
     }
@@ -200,10 +230,10 @@ void spawnMolecule(int templateIdx, float cx, float cy) {
             if (a.id == gid2) a2 = &a;
         }
         if (a1 && a2) {
-            a1->bonded_to.push_back(a2->id);
-            a1->current_bonds++;
-            a2->bonded_to.push_back(a1->id);
-            a2->current_bonds++;
+            a1->bonds.push_back({a2->id, tb.type});
+            a1->current_valency += tb.type;
+            a2->bonds.push_back({a1->id, tb.type});
+            a2->current_valency += tb.type;
         }
     }
 }
@@ -225,14 +255,14 @@ void drawText(SDL_Renderer* r, TTF_Font* f, std::string text, int x, int y, SDL_
 void drawLonePairs(SDL_Renderer* r, Atom& a) {
     // Calculate lone pairs: (Valence - Bonds) / 2
     // Note: This is a simplification. Charge is assumed 0.
-    int lone_pairs = (a.valence_electrons - a.current_bonds) / 2;
+    int lone_pairs = (a.valence_electrons - a.current_valency) / 2;
     if (lone_pairs <= 0) return;
 
     // Calculate vector sum of bonds to find "empty" side
     float sumX = 0, sumY = 0;
-    for (int bid : a.bonded_to) {
+    for (auto& b : a.bonds) {
         for (auto& other : atoms) {
-            if (other.id == bid) {
+            if (other.id == b.target_id) {
                 float dx = other.x - a.x;
                 float dy = other.y - a.y;
                 float len = sqrt(dx*dx + dy*dy);
@@ -321,11 +351,14 @@ int main(int argc, char* args[]) {
                 if (e.key.keysym.sym == SDLK_2 || e.key.keysym.sym == SDLK_KP_2) complexity_level = LEVEL_ORGANIC;
                 if (e.key.keysym.sym == SDLK_3 || e.key.keysym.sym == SDLK_KP_3) complexity_level = LEVEL_LEWIS;
                 
-                // Enter for Auto-Spawn
+                // Enter for Spawn & Iterate
                 if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_RETURN2 || e.key.keysym.sym == SDLK_KP_ENTER) {
                     spawnMolecule(current_template_index, (float)mouseX, (float)mouseY);
-                    auto_spawn_mode = true;
-                    auto_spawn_timer = 0;
+                    // Iterate to next template
+                    if (!templates.empty()) {
+                        current_template_index = (current_template_index + 1) % templates.size();
+                        log("[SEL] " + templates[current_template_index].name);
+                    }
                 }
             }
             // UI Clicks
@@ -359,30 +392,19 @@ int main(int argc, char* args[]) {
         
         if (current_state == STATE_LOADING) {
             loading_progress += 0.5f;
-            if (loading_progress == 20.0f) loadMolecule("data/benzene.chem");
-            if (loading_progress == 60.0f) loadMolecule("data/caffeine.chem");
-            if (loading_progress > 120.0f) {
+            if (loading_progress == 20.0f) {
+                // Load all .chem files from data/
+                loadAllMolecules("data");
+                if (templates.empty()) {
+                    // Fallback if no files found
+                    log("[WARN] No .chem files found in data/");
+                }
+            }
+            if (loading_progress > 60.0f) {
                 current_state = STATE_SIMULATION;
                 log("[SYS] Simulation Started.");
             }
         } else {
-            // Auto Spawn Logic
-            if (mouseX != last_mouse_x || mouseY != last_mouse_y) {
-                auto_spawn_mode = false; // Snap back to manual on move
-            }
-            last_mouse_x = mouseX;
-            last_mouse_y = mouseY;
-
-            if (auto_spawn_mode) {
-                auto_spawn_timer += 1.0f;
-                if (auto_spawn_timer > 60.0f) { // Every ~1 sec
-                    float rx = (float)(rand() % SCREEN_WIDTH);
-                    float ry = (float)(rand() % SCREEN_HEIGHT);
-                    spawnMolecule(current_template_index, rx, ry);
-                    auto_spawn_timer = 0;
-                }
-            }
-
             // Simulation Logic
             if (mouseState & SDL_BUTTON(SDL_BUTTON_LEFT) && mouseY > 40 && mouseY < SCREEN_HEIGHT - 50) { // Don't spawn on UI areas
                 int r = rand() % 100;
@@ -425,14 +447,14 @@ int main(int argc, char* args[]) {
 
             // 2. Dynamic Bonding
             for (size_t i = 0; i < atoms.size(); i++) {
-                if (atoms[i].current_bonds >= atoms[i].max_bonds) continue;
+                if (atoms[i].current_valency >= atoms[i].max_bonds) continue;
                 
                 for (size_t j = i + 1; j < atoms.size(); j++) {
-                    if (atoms[j].current_bonds >= atoms[j].max_bonds) continue;
+                    if (atoms[j].current_valency >= atoms[j].max_bonds) continue;
 
                     // Check if already bonded
                     bool already_bonded = false;
-                    for (int id : atoms[i].bonded_to) if (id == atoms[j].id) already_bonded = true;
+                    for (auto& b : atoms[i].bonds) if (b.target_id == atoms[j].id) already_bonded = true;
                     if (already_bonded) continue;
 
                     float d2 = distSq(atoms[i], atoms[j]);
@@ -441,14 +463,93 @@ int main(int argc, char* args[]) {
                     
                     if (d2 < snapDist*snapDist) {
                         // Logic: Only bond if compatible
-                        // Prevent random H-H or H-C unless specific conditions (optional, per user request)
-                        // User asked to "prevent random H spawning" - handled in spawn logic
-                        // Here we just ensure valid bonds.
+                        // Prevent random H-H or H-C unless specific conditions (optional)
+                        // Prevent random H spawning
                         
-                        atoms[i].bonded_to.push_back(atoms[j].id);
-                        atoms[i].current_bonds++;
-                        atoms[j].bonded_to.push_back(atoms[i].id);
-                        atoms[j].current_bonds++;
+                        atoms[i].bonds.push_back({atoms[j].id, 1});
+                        atoms[i].current_valency++;
+                        atoms[j].bonds.push_back({atoms[i].id, 1});
+                        atoms[j].current_valency++;
+                    }
+                }
+            }
+
+            // 2b. Hydrogen Bonding (Intermolecular)
+            // Allows "saturated" atoms to bond if they are H-bond donors/acceptors
+            // Broadened rules to allow non-canonical pairing (Hoogsteen, etc.) and backbone interactions
+            for (size_t i = 0; i < atoms.size(); i++) {
+                for (size_t j = i + 1; j < atoms.size(); j++) {
+                    // Check for H-bond candidates: H (on N/O/F/P) <-> N/O/F/P
+                    // We treat N, O, F, P as electronegative atoms capable of H-bonding
+                    bool isHBond = false;
+                    
+                    std::string s1 = atoms[i].symbol;
+                    std::string s2 = atoms[j].symbol;
+                    
+                    bool a1_is_H = (s1 == "H");
+                    bool a2_is_H = (s2 == "H");
+                    
+                    if ((a1_is_H || a2_is_H) && !(a1_is_H && a2_is_H)) {
+                        Atom* hAtom = a1_is_H ? &atoms[i] : &atoms[j];
+                        Atom* accAtom = a1_is_H ? &atoms[j] : &atoms[i];
+                        
+                        // Check Acceptor (N, O, F, P, Cl)
+                        std::string accSym = accAtom->symbol;
+                        if (accSym == "N" || accSym == "O" || accSym == "F" || accSym == "P" || accSym == "Cl") {
+                            
+                            // Check if H is polar (bonded to N, O, F, P, Cl)
+                            bool hIsPolar = false;
+                            for(auto& b : hAtom->bonds) {
+                                for(auto& other : atoms) {
+                                    if(other.id == b.target_id) {
+                                        std::string dSym = other.symbol;
+                                        if(dSym == "N" || dSym == "O" || dSym == "F" || dSym == "P" || dSym == "Cl") {
+                                            hIsPolar = true;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if (hIsPolar) {
+                                // Check distance for H-bond
+                                float d2 = distSq(atoms[i], atoms[j]);
+                                // Allow bonding if close enough
+                                if (d2 < (BOND_HYDROGEN_LEN * 1.2f)*(BOND_HYDROGEN_LEN * 1.2f)) {
+                                    // Check if already bonded
+                                    bool already_bonded = false;
+                                    for(auto& b : atoms[i].bonds) if(b.target_id == atoms[j].id) already_bonded = true;
+                                    
+                                    if (!already_bonded) {
+                                        // Specificity Check: Only allow Canonical Base Pairs
+                                        // A-T (or A-U), G-C
+                                        std::string p1 = atoms[i].parent_molecule;
+                                        std::string p2 = atoms[j].parent_molecule;
+                                        
+                                        // If parents are empty (random atoms), allow generic H-bonds
+                                        // If parents are known nucleotides, enforce rules
+                                        bool allowed = true;
+                                        if (!p1.empty() && !p2.empty()) {
+                                            // Normalize names (remove extension if present, though loadMolecule strips it usually)
+                                            // Check pairs
+                                            bool pairAT = (p1 == "Adenine" && (p2 == "Thymine" || p2 == "Uracil")) || 
+                                                          (p2 == "Adenine" && (p1 == "Thymine" || p1 == "Uracil"));
+                                            bool pairGC = (p1 == "Guanine" && p2 == "Cytosine") || 
+                                                          (p2 == "Guanine" && p1 == "Cytosine");
+                                            
+                                            if (!pairAT && !pairGC) allowed = false;
+                                        }
+
+                                        if (allowed) isHBond = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (isHBond) {
+                         atoms[i].bonds.push_back({atoms[j].id, 4});
+                         atoms[j].bonds.push_back({atoms[i].id, 4});
                     }
                 }
             }
@@ -458,7 +559,8 @@ int main(int argc, char* args[]) {
             int iterations = 10; // More iterations = stiffer bonds
             for (int k = 0; k < iterations; k++) {
                 for (size_t i = 0; i < atoms.size(); i++) {
-                    for (int tid : atoms[i].bonded_to) {
+                    for (auto& b : atoms[i].bonds) {
+                        int tid = b.target_id;
                         // Find neighbor
                         int nIdx = -1;
                         for(size_t m=0; m<atoms.size(); m++) if(atoms[m].id == tid) { nIdx = m; break; }
@@ -476,13 +578,8 @@ int main(int argc, char* args[]) {
                         if (dist < 0.001f) dist = 0.001f;
 
                         // Determine Bond Target Length
-                        int order = 1;
-                        if ((a1.symbol == "C" || a1.symbol == "O" || a1.symbol == "N") &&
-                            (a2.symbol == "C" || a2.symbol == "O" || a2.symbol == "N")) {
-                             // Simple heuristic for double bonds if both unsaturated
-                             if (a1.current_bonds < a1.max_bonds && a2.current_bonds < a2.max_bonds) order = 2;
-                        }
-                        float target = getBondLength(a1.symbol, a2.symbol, order);
+                        // Use stored bond order!
+                        float target = getBondLength(a1.symbol, a2.symbol, b.order);
 
                         // Constraint Correction
                         float diff = dist - target;
@@ -516,9 +613,9 @@ int main(int argc, char* args[]) {
                 while(!q.empty()) {
                     int curr = q.front(); q.pop_front();
                     mol.push_back(curr);
-                    for(int bid : atoms[curr].bonded_to) {
-                        if(idToIndex.count(bid)) {
-                            int neighborIdx = idToIndex[bid];
+                    for(auto& b : atoms[curr].bonds) {
+                        if(idToIndex.count(b.target_id)) {
+                            int neighborIdx = idToIndex[b.target_id];
                             if(!visited[neighborIdx]) {
                                 visited[neighborIdx] = true;
                                 q.push_back(neighborIdx);
@@ -530,57 +627,40 @@ int main(int argc, char* args[]) {
             }
 
             // Step B: Collide Molecules
+            // REPLACED Bounding Circle with Atom-Atom Repulsion for better shape fitting
+            // This allows irregular molecules (like nucleotides) to interlock and bond
             for (size_t i = 0; i < molecules.size(); i++) {
                 for (size_t j = i + 1; j < molecules.size(); j++) {
-                    // Calculate Bounding Circles
-                    float cx1=0, cy1=0, cx2=0, cy2=0;
-                    for(int idx : molecules[i]) { cx1 += atoms[idx].x; cy1 += atoms[idx].y; }
-                    for(int idx : molecules[j]) { cx2 += atoms[idx].x; cy2 += atoms[idx].y; }
-                    cx1 /= molecules[i].size(); cy1 /= molecules[i].size();
-                    cx2 /= molecules[j].size(); cy2 /= molecules[j].size();
-
-                    float r1=0, r2=0;
-                    for(int idx : molecules[i]) {
-                        float d = sqrt(pow(atoms[idx].x - cx1, 2) + pow(atoms[idx].y - cy1, 2));
-                        if(d > r1) r1 = d;
-                    }
-                    for(int idx : molecules[j]) {
-                        float d = sqrt(pow(atoms[idx].x - cx2, 2) + pow(atoms[idx].y - cy2, 2));
-                        if(d > r2) r2 = d;
-                    }
-                    r1 += ATOM_RADIUS; r2 += ATOM_RADIUS; // Add atom radius buffer
-
-                    // Check Collision
-                    float dx = cx2 - cx1;
-                    float dy = cy2 - cy1;
-                    float dist = sqrt(dx*dx + dy*dy);
-                    float minDist = r1 + r2;
-
-                    if (dist < minDist && dist > 0) {
-                        // Resolve Collision: Move entire molecules apart
-                        float overlap = minDist - dist;
-                        float nx = dx / dist;
-                        float ny = dy / dist;
-                        
-                        // Move proportional to inverse mass (here mass = atom count)
-                        float m1 = (float)molecules[i].size();
-                        float m2 = (float)molecules[j].size();
-                        float totalM = m1 + m2;
-                        
-                        float move1 = overlap * (m2 / totalM);
-                        float move2 = overlap * (m1 / totalM);
-
-                        for(int idx : molecules[i]) {
-                            atoms[idx].x -= nx * move1;
-                            atoms[idx].y -= ny * move1;
-                            // Add bounce impulse
-                            atoms[idx].vx -= nx * 0.5f; atoms[idx].vy -= ny * 0.5f;
-                        }
-                        for(int idx : molecules[j]) {
-                            atoms[idx].x += nx * move2;
-                            atoms[idx].y += ny * move2;
-                            // Add bounce impulse
-                            atoms[idx].vx += nx * 0.5f; atoms[idx].vy += ny * 0.5f;
+                    // Detailed Atom-Atom check between molecules
+                    for(int idx1 : molecules[i]) {
+                        for(int idx2 : molecules[j]) {
+                            float dx = atoms[idx1].x - atoms[idx2].x;
+                            float dy = atoms[idx1].y - atoms[idx2].y;
+                            float d2 = dx*dx + dy*dy;
+                            float minR = ATOM_RADIUS * 2.0f; // Simple hard shell
+                            
+                            if (d2 < minR*minR && d2 > 0) {
+                                float dist = sqrt(d2);
+                                float overlap = minR - dist;
+                                float nx = dx/dist;
+                                float ny = dy/dist;
+                                
+                                // Push apart
+                                atoms[idx1].x += nx * overlap * 0.5f;
+                                atoms[idx1].y += ny * overlap * 0.5f;
+                                atoms[idx2].x -= nx * overlap * 0.5f;
+                                atoms[idx2].y -= ny * overlap * 0.5f;
+                                
+                                // Transfer momentum (elastic-ish)
+                                float v1n = atoms[idx1].vx * nx + atoms[idx1].vy * ny;
+                                float v2n = atoms[idx2].vx * nx + atoms[idx2].vy * ny;
+                                
+                                // Simple exchange with damping
+                                atoms[idx1].vx -= (v1n - v2n) * nx * 0.8f;
+                                atoms[idx1].vy -= (v1n - v2n) * ny * 0.8f;
+                                atoms[idx2].vx += (v1n - v2n) * nx * 0.8f;
+                                atoms[idx2].vy += (v1n - v2n) * ny * 0.8f;
+                            }
                         }
                     }
                 }
@@ -599,14 +679,14 @@ int main(int argc, char* args[]) {
                         // Only saturate if the atom is somewhat stable (not flying too fast)
                         if (abs(atoms[i].vx) > 0.5f || abs(atoms[i].vy) > 0.5f) continue;
 
-                        int missing = atoms[i].max_bonds - atoms[i].current_bonds;
+                        int missing = atoms[i].max_bonds - atoms[i].current_valency;
                         if (missing > 0) {
                             // Calculate base angle based on existing bonds to avoid overlap
                             float base_angle = 0.0f;
-                            if (!atoms[i].bonded_to.empty()) {
+                            if (!atoms[i].bonds.empty()) {
                                 // Find angle away from first bond to distribute H on the other side
                                 for(auto& other : atoms) {
-                                    if(other.id == atoms[i].bonded_to[0]) {
+                                    if(other.id == atoms[i].bonds[0].target_id) {
                                         base_angle = atan2(atoms[i].y - other.y, atoms[i].x - other.x);
                                         break;
                                     }
@@ -619,7 +699,7 @@ int main(int argc, char* args[]) {
                             for (int k = 0; k < missing; k++) {
                                 // Spread hydrogens out in a fan or circle
                                 float angle_offset = (missing == 1) ? 0.0f : ((k + 1) * (3.14159f / (missing + 1)) - 1.57f);
-                                if (atoms[i].bonded_to.empty()) angle_offset = k * (6.28f / missing); // Full circle if no bonds
+                                if (atoms[i].bonds.empty()) angle_offset = k * (6.28f / missing); // Full circle if no bonds
                                 
                                 float angle = base_angle + angle_offset;
                                 // Add slight randomness for organic feel
@@ -634,10 +714,10 @@ int main(int argc, char* args[]) {
                                 Atom& h = atoms.back();
                                 h.vx = atoms[i].vx; h.vy = atoms[i].vy; // Match velocity
                                 
-                                atoms[i].bonded_to.push_back(h.id);
-                                atoms[i].current_bonds++;
-                                h.bonded_to.push_back(atoms[i].id);
-                                h.current_bonds++;
+                                atoms[i].bonds.push_back({h.id, 1});
+                                atoms[i].current_valency++;
+                                h.bonds.push_back({atoms[i].id, 1});
+                                h.current_valency++;
                             }
                         }
                     }
@@ -683,20 +763,14 @@ int main(int argc, char* args[]) {
             // Draw Bonds
             SDL_SetRenderDrawColor(renderer, 100, 100, 100, 255);
             for (auto& a : atoms) {
-                for (int tid : a.bonded_to) {
+                for (auto& b : a.bonds) {
+                    int tid = b.target_id;
                     // Avoid drawing twice
                     if (a.id > tid) continue;
 
                     for (auto& t : atoms) {
                         if (t.id == tid) {
-                            // Determine bond order (simplified: O=O, C=O, C#N etc based on valency remaining)
-                            // For this art demo, we'll just assume double bonds for O, N if unsaturated
-                            int bondOrder = 1;
-                            if ((a.symbol == "O" || a.symbol == "N" || a.symbol == "C") && 
-                                (t.symbol == "O" || t.symbol == "N" || t.symbol == "C")) {
-                                // Heuristic: if both have spare valency, draw double
-                                if (a.current_bonds < a.max_bonds && t.current_bonds < t.max_bonds) bondOrder = 2;
-                            }
+                            int bondOrder = b.order;
 
                             // Draw Lines
                             if (bondOrder == 2) {
@@ -706,6 +780,21 @@ int main(int argc, char* args[]) {
                                 SDL_RenderDrawLine(renderer, a.x, a.y, t.x, t.y);
                                 SDL_RenderDrawLine(renderer, a.x-4, a.y-4, t.x-4, t.y-4);
                                 SDL_RenderDrawLine(renderer, a.x+4, a.y+4, t.x+4, t.y+4);
+                            } else if (bondOrder == 4) {
+                                // Hydrogen Bond (Dashed Line - simulated with dots)
+                                float dx = t.x - a.x;
+                                float dy = t.y - a.y;
+                                float dist = sqrt(dx*dx + dy*dy);
+                                int segments = (int)(dist / 5.0f);
+                                SDL_SetRenderDrawColor(renderer, 100, 100, 255, 150); // Light Blue
+                                for(int k=0; k<segments; k+=2) {
+                                    float x1 = a.x + (dx/dist) * (k*5.0f);
+                                    float y1 = a.y + (dy/dist) * (k*5.0f);
+                                    float x2 = a.x + (dx/dist) * ((k+1)*5.0f);
+                                    float y2 = a.y + (dy/dist) * ((k+1)*5.0f);
+                                    SDL_RenderDrawLine(renderer, (int)x1, (int)y1, (int)x2, (int)y2);
+                                }
+                                SDL_SetRenderDrawColor(renderer, 100, 100, 100, 255); // Reset
                             } else {
                                 SDL_RenderDrawLine(renderer, a.x, a.y, t.x, t.y);
                             }
@@ -726,8 +815,8 @@ int main(int argc, char* args[]) {
                 else if (complexity_level == LEVEL_ORGANIC) {
                     // Hide Hydrogens on Carbons
                     if (a.symbol == "H") {
-                        for (int bid : a.bonded_to) {
-                            for (auto& n : atoms) if (n.id == bid && n.symbol == "C") draw = false;
+                        for (auto& b : a.bonds) {
+                            for (auto& n : atoms) if (n.id == b.target_id && n.symbol == "C") draw = false;
                         }
                     }
                     // Carbons are just dots
